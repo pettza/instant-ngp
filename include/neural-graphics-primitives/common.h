@@ -187,4 +187,15 @@ inline NGP_HOST_DEVICE uint32_t binary_search(float val, const float* data, uint
 	return std::min(first, length-1);
 }
 
+// Taken from https://pbr-book.org/3ed-2018/Geometry_and_Transformations/Vectors
+inline NGP_HOST_DEVICE void coordinateSystem(const Eigen::Vector3f &v1, Eigen::Vector3f *v2, Eigen::Vector3f *v3) {
+    if (abs(v1.x()) > abs(v1.y()))
+        *v2 = Eigen::Vector3f(-v1.z(), 0, v1.x()) /
+              sqrt(v1.x() * v1.x() + v1.z() * v1.z());
+    else
+        *v2 = Eigen::Vector3f(0, v1.z(), -v1.y()) /
+              sqrt(v1.y() * v1.y() + v1.z() * v1.z());
+    *v3 = v1.cross(*v2);
+}
+
 NGP_NAMESPACE_END

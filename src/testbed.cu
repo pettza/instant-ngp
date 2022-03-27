@@ -1166,13 +1166,29 @@ void Testbed::draw_gui() {
 		list->AddText(ImVec2(4.f, 4.f), 0xffffffff, "Ground Truth");
 	}
 
+	auto im_mouse = ImGui::GetMousePos();
+
 	ImGui::Render();
 	ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
 	glClear(GL_DEPTH_BUFFER_BIT);
+
 	Vector2i res(display_w, display_h);
 	Vector2f focal_length = calc_focal_length(res, m_fov_axis, m_zoom);
 	Vector2f screen_center = render_screen_center();
+	
+	glPointSize(3);
+	m_sampler.sample();
+	m_sampler.render(res, focal_length, m_smoothed_camera);
+	
+	glDisable(GL_DEPTH_TEST);
+	glEnable(GL_BLEND);
+	glBlendEquation(GL_FUNC_ADD);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	Vector2f mouse = {im_mouse.x, im_mouse.y};
+	m_brush.getInteractionPoint(m_sdf.tracer.rays_init(), res, m_render_surfaces.front().resolution(), mouse);
+	m_brush.render(res, focal_length, m_smoothed_camera);
+	
 	draw_mesh_gl(m_mesh.verts, m_mesh.vert_normals, m_mesh.vert_colors, m_mesh.indices, res, focal_length, m_smoothed_camera, screen_center, (int)m_mesh_render_mode);
 
 	glfwSwapBuffers(m_glfw_window);
@@ -1373,6 +1389,12 @@ void Testbed::init_window(int resw, int resh, bool hidden) {
 	m_pip_render_surface = std::make_unique<CudaRenderBuffer>(m_pip_render_texture);
 
 	m_render_window = true;
+
+	m_brush.initialize();
+	m_sampler.set_size(100000);
+	m_sampler.set_network(m_network);
+	m_sampler.set_bounding_box(m_aabb);
+	m_sampler.initialize();
 #endif
 }
 

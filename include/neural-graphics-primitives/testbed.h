@@ -23,6 +23,8 @@
 #include <neural-graphics-primitives/render_buffer.h>
 #include <neural-graphics-primitives/sdf.h>
 #include <neural-graphics-primitives/trainable_buffer.cuh>
+#include <neural-graphics-primitives/brush.h>
+#include <neural-graphics-primitives/sdf_sampler.h>
 
 #include <tiny-cuda-nn/cuda_graph.h>
 #include <tiny-cuda-nn/random.h>
@@ -294,6 +296,7 @@ public:
 	void set_camera_to_training_view(int trainview);
 	void reset_camera();
 	bool keyboard_event();
+	void generate_training_samples_sdf_edit(Eigen::Vector3f* positions, float* distances, cudaStream_t stream);
 	void generate_training_samples_sdf(Eigen::Vector3f* positions, float* distances, uint32_t n_to_generate, cudaStream_t stream, bool uniform_only);
 	void update_density_grid_nerf(float decay, uint32_t n_uniform_density_grid_samples, uint32_t n_nonuniform_density_grid_samples, cudaStream_t stream);
 	void update_density_grid_mean_and_bitfield(cudaStream_t stream);
@@ -305,6 +308,7 @@ public:
 	void imgui();
 	void training_prep_nerf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream);
 	void training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream);
+	void tatining_prep_sdf_edit(cudaStream_t stream);
 	void training_prep_image(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {}
 	void train(uint32_t n_training_steps, uint32_t batch_size);
 	Eigen::Vector2f calc_focal_length(const Eigen::Vector2i& resolution, int fov_axis, float zoom) const ;
@@ -771,6 +775,9 @@ public:
 		Eigen::Vector2i resolution;
 	} m_distortion;
 	std::shared_ptr<NerfNetwork<precision_t>> m_nerf_network;
+
+	Brush m_brush;
+	SDFSampler m_sampler;
 };
 
 NGP_NAMESPACE_END

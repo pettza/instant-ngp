@@ -296,7 +296,18 @@ __global__ void write_shadow_ray_result(const uint32_t n_elements, BoundingBox a
 	shadow_factors[shadow_payloads[i].idx] = aabb.contains(positions[i]) ? 0.0f : min_visibility[i];
 }
 
-__global__ void shade_kernel_sdf(const uint32_t n_elements, BoundingBox aabb, float floor_y, const ERenderMode mode, const BRDFParams brdf, Vector3f sun_dir, Vector3f up_dir, Matrix<float, 3, 4> camera_matrix, Vector3f* positions, Vector3f* normals, float* distances, SdfPayload* payloads, Array4f* frame_buffer) {
+__global__ void shade_kernel_sdf(
+	const uint32_t n_elements,
+	BoundingBox aabb,
+	float floor_y,
+	const ERenderMode mode,
+	const BRDFParams brdf,
+	Vector3f sun_dir,
+	Vector3f up_dir,
+	Matrix<float, 3, 4> camera_matrix,
+	Vector3f* positions, Vector3f* normals, float* distances, SdfPayload* payloads,
+	Vector3f* __restrict__ out_positions, Vector3f* __restrict__ out_normals,
+	Array4f* frame_buffer) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 
@@ -360,6 +371,8 @@ __global__ void shade_kernel_sdf(const uint32_t n_elements, BoundingBox aabb, fl
 	}
 
 	frame_buffer[payload.idx] = {color.x(), color.y(), color.z(), 1.0f};
+	out_positions[payload.idx] = pos;
+	out_normals[payload.idx] = normal;
 }
 
 __global__ void compact_kernel_shadow_sdf(
@@ -934,6 +947,8 @@ void Testbed::render_sdf(
 		m_network->visualize_activation(stream, m_visualized_layer, m_visualized_dimension, positions_matrix, colors_matrix);
 	}
 
+	RaysSdfSoa& rays_tmp = m_sdf.tracer.rays_init();
+	CUDA_CHECK_THROW(cudaMemsetAsync(rays_tmp.pos.data(), 0, rays_tmp.pos.size() * sizeof(Vector3f), stream));
 	linear_kernel(shade_kernel_sdf, 0, stream,
 		n_hit,
 		m_aabb,
@@ -947,6 +962,8 @@ void Testbed::render_sdf(
 		rays_hit.normal.data(),
 		rays_hit.distance.data(),
 		rays_hit.payload.data(),
+		rays_tmp.pos.data(), // Store the positions and normals of the rays at the correct index for cursor lookup
+		rays_tmp.normal.data(),
 		render_buffer.frame_buffer()
 	);
 
@@ -1032,6 +1049,11 @@ void Testbed::load_mesh() {
 
 	tlog::success() << "Loaded mesh: triangles=" << n_triangles << " AABB=" << m_raw_aabb << " after scaling=" << m_aabb;
 }
+
+void Testbed::generate_training_samples_sdf_edit(Eigen::Vector3f* positions, float* distances, cudaStream_t stream) {
+
+}
+	
 
 void Testbed::generate_training_samples_sdf(Vector3f* positions, float* distances, uint32_t n_to_generate, cudaStream_t stream, bool uniform_only) {
 	uint32_t n_to_generate_base = n_to_generate / 8;
@@ -1166,6 +1188,9 @@ void Testbed::train_sdf(size_t target_batch_size, size_t n_steps, cudaStream_t s
 	}
 }
 
+void training_prep_sdf_edit(cudaStream_t stream) {
+	
+}
 
 void Testbed::training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
 	if (m_sdf.training.generate_sdf_data_online) {
