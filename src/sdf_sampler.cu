@@ -10,96 +10,6 @@
 
 NGP_NAMESPACE_BEGIN
 
-// Refinement steps when initializing
-constexpr int INIT_REFINEMENT_STEPS = 7;
-// Refinement steps when sampling
-constexpr int SAMPLING_REFINEMENT_STEPS = 7;
-constexpr float REFINEMENT_THRESHOLD = 0.03;
-constexpr float ACCEPTANCE_THRESHOLD = 0.009;
-constexpr float SIGMA_PERTURB = 0.04;
-
-template<typename RNG, size_t N_TO_GENERATE>
-__global__ void random_uints_kernel(
-    const size_t n_elements,
-    RNG rng,
-    uint32_t max_val,
-    uint32_t* __restrict__ out
-) {
-    const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
-	const size_t n_threads = blockDim.x * gridDim.x;
-
-	rng.advance(i*N_TO_GENERATE);
-    
-    #pragma unroll
-	for (size_t j = 0; j < N_TO_GENERATE; ++j) {
-		const size_t idx = i + n_threads * j;
-		if (idx >= n_elements) return;
-
-		out[idx] = rng.next_uint() % max_val;
-	}
-}
-
-template<typename RNG>
-void random_uints(
-    cudaStream_t stream,
-    const size_t n_elements,
-    RNG rng,
-    uint32_t max_val,
-    tcnn::GPUMemory<uint32_t>& out
-) {
-    constexpr size_t N_TO_GENERATE = 4;
-
-    out.enlarge(n_elements);
-
-    size_t n_threads = tcnn::div_round_up(n_elements, N_TO_GENERATE);
-    random_uints_kernel<RNG, N_TO_GENERATE><<<tcnn::n_blocks_linear(n_threads), tcnn::n_threads_linear, 0, stream>>>(
-        n_elements, rng, max_val, out.data()
-    );
-}
-
-template<typename RNG, size_t N_TO_GENERATE>
-__global__ void sample_bounding_box_uniform_kernel(
-    const size_t n_elements,
-    RNG rng,
-    const BoundingBox bb,
-    Eigen::Vector3f* __restrict__ out
-) {
-    const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
-    const size_t n_threads = blockDim.x * gridDim.x;
-
-	rng.advance(i * N_TO_GENERATE);
-	
-	#pragma unroll
-	for (size_t j = 0; j < N_TO_GENERATE; ++j) {
-		const size_t idx = i + n_threads * j;		
-        const size_t offset = idx / 3;
-
-        if (offset >= n_elements) return;
-        
-        const size_t xyz = idx % 3;
-        const float val = rng.next_float(), l = bb.diag()[xyz], o = bb.min[xyz];
-        out[offset][xyz] = o + val * l;
-    }
-}
-
-template<typename RNG>
-void sample_bounding_box_uniform(
-    cudaStream_t stream,
-    size_t n_elements,
-    RNG& rng,
-    const BoundingBox& bb,
-    tcnn::GPUMemory<Eigen::Vector3f>& out
-) {
-    constexpr size_t N_TO_GENERATE = 4;
-
-    out.enlarge(n_elements);
-
-    size_t n_threads = tcnn::div_round_up(n_elements, N_TO_GENERATE);
-    sample_bounding_box_uniform_kernel<RNG, N_TO_GENERATE><<<tcnn::n_blocks_linear(n_threads), tcnn::n_threads_linear, 0, stream>>>(
-        n_elements, rng, bb, out.data()
-    );
-}
-
 void compute_distances_normals(
     cudaStream_t stream,
     tcnn::Network<float, precision_t>& network,
@@ -202,105 +112,6 @@ void project_samples(
     compute_distances_normals(stream, network, samples, start_index, n_elements);
 }
 
-template<typename RNG, size_t N_TO_GENERATE>
-__global__ void perturb_samples_logistic_kernel(
-    const size_t n_elements,
-    RNG rng,
-    const float scale,
-    Eigen::Vector3f* __restrict__ out
-) {
-    const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
-    const size_t n_threads = blockDim.x * gridDim.x;
-
-	rng.advance(i * N_TO_GENERATE);
-	
-	#pragma unroll
-	for (size_t j = 0; j < N_TO_GENERATE; ++j) {
-		const size_t idx = i + n_threads * j;		
-        const size_t offset = idx / 3;
-
-        if (offset >= n_elements) return;
-        
-        const size_t xyz = idx % 3;
-        float val = rng.next_float();
-        val = tcnn::logit(val) * scale * 0.551328895f;
-        out[offset][xyz] += val;
-    }
-}
-
-template<typename RNG>
-void perturb_samples_logistic(
-    cudaStream_t stream,
-    RNG& rng,
-    SamplesSoa& samples,
-    size_t start_index,
-    size_t n_elements,
-    float scale
-) {
-    constexpr size_t N_TO_GENERATE = 4;
-    size_t n_threads = tcnn::div_round_up(n_elements, N_TO_GENERATE);
-    
-    perturb_samples_logistic_kernel<RNG, N_TO_GENERATE><<<tcnn::n_blocks_linear(n_threads), tcnn::n_threads_linear, 0, stream>>>(
-        n_elements, rng, scale, samples.points.data() + start_index
-    );
-}
-
-template<typename RNG>
-__global__ void perturb_samples_disk_kernel(
-    size_t n_elements,
-    RNG rng,
-    float scale,
-    const Eigen::Vector3f* __restrict__ normals,
-    Eigen::Vector3f* __restrict__ out
-) {
-    const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
-
-	rng.advance(i * 2);
-
-    Eigen::Vector2f uv = scale * random_uniform_disc(rng);
-    Eigen::Vector3f n, t1, t2;
-    n = normals[i];
-    coordinateSystem(n, &t1, &t2);
-    
-    out[i] += uv.x() * t1 + uv.y() * t2;
-}
-
-template<typename RNG>
-void perturb_samples_disk(
-    cudaStream_t stream,
-    RNG& rng,
-    SamplesSoa& samples,
-    size_t start_index,
-    size_t n_elements,
-    float scale
-) {
-    tcnn::linear_kernel(perturb_samples_disk_kernel<RNG>, 0, stream,
-        n_elements,
-        rng,
-        scale,
-        samples.normals.data() + start_index,
-        samples.points.data() + start_index
-    );
-}
-
-void SDFSampler::initialize() {
-    m_curr_size = 0;
-    extend_samples();
-}
-
-SamplesSoa& SDFSampler::sample() {
-    perturb_samples_disk(m_stream, m_rng, m_samples, 0, m_size, SIGMA_PERTURB);
-    project_samples(m_stream, *m_network, m_samples, 0, m_size, SAMPLING_REFINEMENT_STEPS);
-    
-    m_curr_size = filter_samples(0, m_size, ACCEPTANCE_THRESHOLD);
-    if (m_curr_size < m_size) {
-        // std::cout << m_curr_size << std::endl;
-        extend_samples();
-    }
-      
-    return m_samples;
-}
-
 __global__ void gather_indices_kernel(
     size_t n_elements,
     const uint32_t* __restrict__ indices,
@@ -310,53 +121,6 @@ __global__ void gather_indices_kernel(
     const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
 
     if (i < n_elements) out[i] = in[indices[i]];
-}
-
-void SDFSampler::extend_samples() {
-    if (m_curr_size == 0) {
-        sample_bounding_box_uniform(
-            m_stream,
-            m_samples_per_extension,
-            m_rng,
-            m_bounding_box,
-            m_samples.points
-        );
-    } else {
-        random_uints(m_stream, m_samples_per_extension, m_rng, (uint32_t) m_curr_size, m_indices);
-        
-        Eigen::Vector3f* ptr = m_samples.points.data();
-        tcnn::linear_kernel(gather_indices_kernel, 0, m_stream,
-            m_samples_per_extension, m_indices.data(), ptr, ptr + m_curr_size
-        );
-
-    }
-
-    while (true) {
-        project_samples(m_stream, *m_network, m_samples, m_curr_size, m_samples_per_extension, INIT_REFINEMENT_STEPS);
-        
-        uint32_t n_accepted = filter_samples(m_curr_size, m_samples_per_extension, ACCEPTANCE_THRESHOLD);
-        uint32_t prev_size = m_curr_size;
-        m_curr_size = min(m_curr_size + n_accepted, m_size);
-
-        if (m_curr_size == m_size) break;
-
-        // Sample with replacement points from prev_size to m_curr_size
-        random_uints(m_stream, m_samples_per_extension, m_rng, (uint32_t) n_accepted, m_indices);
-        
-        Eigen::Vector3f* ptr = m_samples.points.data();
-        tcnn::linear_kernel(gather_indices_kernel, 0, m_stream,
-            m_samples_per_extension, m_indices.data(), ptr + prev_size, ptr + m_curr_size
-        );
-        
-        // random_uints(m_stream, m_samples_per_extension, m_rng, (uint32_t) m_curr_size, m_indices);
-        
-        // Eigen::Vector3f* ptr = m_samples.points.data();
-        // tcnn::linear_kernel(gather_indices_kernel, 0, m_stream,
-        //     m_samples_per_extension, m_indices.data(), ptr, ptr + m_curr_size
-        // );
-        
-        perturb_samples_logistic(m_stream, m_rng, m_samples, m_curr_size, m_samples_per_extension, SIGMA_PERTURB);
-    }
 }
 
 __global__ void filter_samples_kernel(
@@ -379,12 +143,17 @@ __global__ void filter_samples_kernel(
     }
 }
 
-uint32_t SDFSampler::filter_samples(size_t start_index, size_t n_elements, float threshold) {
-    CUDA_CHECK_THROW(cudaMemsetAsync(m_counter.data(), 0, sizeof(uint32_t), m_stream));
+uint32_t SDFSampler::filter_samples(
+    cudaStream_t stream,
+    size_t start_index,
+    size_t n_elements,
+    float threshold
+) {
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_counter.data(), 0, sizeof(uint32_t), stream));
     
-    tcnn::linear_kernel(filter_samples_kernel, 0, m_stream,
+    tcnn::linear_kernel(filter_samples_kernel, 0, stream,
         n_elements,
-        m_bounding_box,
+        m_aabb,
         threshold,
         m_counter.data(),
         m_samples.distances.data() + start_index,
@@ -393,8 +162,8 @@ uint32_t SDFSampler::filter_samples(size_t start_index, size_t n_elements, float
     );
 
     uint32_t cpu_counter;
-    CUDA_CHECK_THROW(cudaMemcpyAsync(&cpu_counter, m_counter.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost, m_stream));
-    CUDA_CHECK_THROW(cudaStreamSynchronize(m_stream));
+    CUDA_CHECK_THROW(cudaMemcpyAsync(&cpu_counter, m_counter.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
 
     if (cpu_counter != n_elements) {
         CUDA_CHECK_THROW(cudaMemcpyAsync(
@@ -402,7 +171,7 @@ uint32_t SDFSampler::filter_samples(size_t start_index, size_t n_elements, float
             m_buffer.data(),
             cpu_counter * sizeof(Eigen::Vector3f),
             cudaMemcpyDeviceToDevice,
-            m_stream
+            stream
         ));
     }
     
@@ -434,15 +203,16 @@ void main() {
 }
 )foo";
 
-void SDFSampler::render(
+void SamplesSoa::render(
+    size_t n_elements,
     const Eigen::Vector2i& resolution,
     const Eigen::Vector2f& focal_length,
     const Eigen::Matrix<float, 3, 4>& camera_matrix
-) {
+) const {
     GLuint VAO, VBO;
-    std::unique_ptr<Eigen::Vector3f[]> points = std::make_unique<Eigen::Vector3f[]>(m_size);
+    std::unique_ptr<Eigen::Vector3f[]> cpu_points = std::make_unique<Eigen::Vector3f[]>(n_elements);
     CUDA_CHECK_THROW(cudaMemcpy(
-        points.get(), m_samples.points.data(), m_size * sizeof(Eigen::Vector3f), cudaMemcpyDeviceToHost
+        cpu_points.get(), points.data(), n_elements * sizeof(Eigen::Vector3f), cudaMemcpyDeviceToHost
     ));
 
     // Setup Vertex Array
@@ -453,7 +223,7 @@ void SDFSampler::render(
     
     // Pass postition data
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, m_size * sizeof(Eigen::Vector3f), points.get(), GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, n_elements * sizeof(Eigen::Vector3f), cpu_points.get(), GL_STATIC_DRAW);
 
     // Enable attribute
     glEnableVertexAttribArray(0);
@@ -504,7 +274,7 @@ void SDFSampler::render(
     glUniform2f(glGetUniformLocation(prog, "f"), focal_length.x(), focal_length.y());
 	glUniform2i(glGetUniformLocation(prog, "res"), resolution.x(), resolution.y());
 
-    glDrawArrays(GL_POINTS, 0, m_size);
+    glDrawArrays(GL_POINTS, 0, n_elements);
 
     glUseProgram(0);
     glBindVertexArray(0);

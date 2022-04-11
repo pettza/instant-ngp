@@ -1050,11 +1050,6 @@ void Testbed::load_mesh() {
 	tlog::success() << "Loaded mesh: triangles=" << n_triangles << " AABB=" << m_raw_aabb << " after scaling=" << m_aabb;
 }
 
-void Testbed::generate_training_samples_sdf_edit(Eigen::Vector3f* positions, float* distances, cudaStream_t stream) {
-
-}
-	
-
 void Testbed::generate_training_samples_sdf(Vector3f* positions, float* distances, uint32_t n_to_generate, cudaStream_t stream, bool uniform_only) {
 	uint32_t n_to_generate_base = n_to_generate / 8;
 	const uint32_t n_to_generate_surface_exact = uniform_only ? 0 : n_to_generate_base*4;
@@ -1188,8 +1183,54 @@ void Testbed::train_sdf(size_t target_batch_size, size_t n_steps, cudaStream_t s
 	}
 }
 
-void training_prep_sdf_edit(cudaStream_t stream) {
-	
+void Testbed::train_sdf_edit(size_t n_steps, cudaStream_t stream) {
+	const uint32_t n_output_dims = 1;
+	const uint32_t n_input_dims = 3;
+
+	float total_loss = 0;
+	uint32_t n_loss_samples = 0;
+
+	size_t batch_size = m_brush.get_size();
+
+	m_sdf.training.positions.enlarge(batch_size);
+	m_sdf.training.distances.enlarge(batch_size);
+
+	for (size_t i = 0; i < n_steps; ++i) {
+		float loss_value;
+		const SamplesSoa& samples = m_brush.generate_training_samples(stream);
+
+		CUDA_CHECK_THROW(cudaMemcpyAsync(
+        	m_sdf.training.positions.data(),
+			samples.points.data(),
+			batch_size * sizeof(Eigen::Vector3f),
+			cudaMemcpyDeviceToDevice,
+			stream
+    	));
+		CUDA_CHECK_THROW(cudaMemcpyAsync(
+			m_sdf.training.distances.data(),
+			samples.distances.data(),
+			batch_size * sizeof(float),
+			cudaMemcpyDeviceToDevice,
+			stream
+		));
+
+		// GPUMatrix<float> training_target_matrix(samples.distances.data(), n_output_dims, batch_size);
+		// GPUMatrix<float> training_batch_matrix((float*)samples.points.data(), n_input_dims, batch_size);
+		
+		GPUMatrix<float> training_target_matrix(m_sdf.training.distances.data(), n_output_dims, batch_size);
+		GPUMatrix<float> training_batch_matrix((float*)m_sdf.training.positions.data(), n_input_dims, batch_size);
+
+		m_trainer->training_step(stream, training_batch_matrix, training_target_matrix, &loss_value);
+
+		total_loss += loss_value;
+		++n_loss_samples;
+
+		m_training_step++;
+	}
+
+	m_loss_scalar = total_loss / (float)n_loss_samples;
+	// std::cout << m_loss_scalar << std::endl;
+	update_loss_graph();
 }
 
 void Testbed::training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {

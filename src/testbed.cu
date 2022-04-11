@@ -1040,15 +1040,17 @@ void Testbed::mouse_drag(const Vector2f& rel, int button) {
 	}
 
 	if (is_right_held) {
-		Matrix3f rot =
-			(AngleAxisf(static_cast<float>(-rel.x() * 2 * PI()), up) * // Scroll sideways around up vector
-			AngleAxisf(static_cast<float>(-rel.y() * 2 * PI()), side)).matrix(); // Scroll around side vector
+		if (shift) {
+			Matrix3f rot =
+				(AngleAxisf(static_cast<float>(-rel.x() * 2 * PI()), up) * // Scroll sideways around up vector
+				AngleAxisf(static_cast<float>(-rel.y() * 2 * PI()), side)).matrix(); // Scroll around side vector
 
-		if (m_render_mode == ERenderMode::Shade)
-			m_sun_dir = rot.transpose() * m_sun_dir;
-		m_slice_plane_z += -rel.y() * m_bounding_radius;
-		reset_accumulation();
-	}
+			if (m_render_mode == ERenderMode::Shade)
+				m_sun_dir = rot.transpose() * m_sun_dir;
+			m_slice_plane_z += -rel.y() * m_bounding_radius;
+			reset_accumulation();
+		} else if (m_sdf.edit_mode && m_brush.has_interaction()) m_sdf.edit_iteration = true;
+	} else m_sdf.edit_iteration = false;
 
 	bool is_middle_held = (button & 4) != 0;
 	if (is_middle_held) {
@@ -1176,19 +1178,25 @@ void Testbed::draw_gui() {
 	Vector2i res(display_w, display_h);
 	Vector2f focal_length = calc_focal_length(res, m_fov_axis, m_zoom);
 	Vector2f screen_center = render_screen_center();
-	
-	glPointSize(3);
-	m_sampler.sample();
-	m_sampler.render(res, focal_length, m_smoothed_camera);
-	
-	glDisable(GL_DEPTH_TEST);
-	glEnable(GL_BLEND);
-	glBlendEquation(GL_FUNC_ADD);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	Vector2f mouse = {im_mouse.x, im_mouse.y};
-	m_brush.getInteractionPoint(m_sdf.tracer.rays_init(), res, m_render_surfaces.front().resolution(), mouse);
-	m_brush.render(res, focal_length, m_smoothed_camera);
-	
+
+	if (m_sdf.edit_mode) {
+		Vector2f mouse = {im_mouse.x, im_mouse.y};
+		m_brush.get_interaction_point(m_sdf.tracer.rays_init(), res, m_render_surfaces.front().resolution(), mouse);
+		
+		glDisable(GL_DEPTH_TEST);
+		glEnable(GL_BLEND);
+		glBlendEquation(GL_FUNC_ADD);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		m_brush.render(res, focal_length, m_smoothed_camera);
+	}
+
+	// if (m_brush.has_interaction()) {
+	// 	auto sdf_samples = m_brush.generate_training_samples(nullptr);
+		
+	// 	glPointSize(3);
+	// 	sdf_samples.render(m_brush.get_size(), res, focal_length, m_smoothed_camera);
+	// }
+
 	draw_mesh_gl(m_mesh.verts, m_mesh.vert_normals, m_mesh.vert_colors, m_mesh.indices, res, focal_length, m_smoothed_camera, screen_center, (int)m_mesh_render_mode);
 
 	glfwSwapBuffers(m_glfw_window);
@@ -1390,11 +1398,15 @@ void Testbed::init_window(int resw, int resh, bool hidden) {
 
 	m_render_window = true;
 
-	m_brush.initialize();
-	m_sampler.set_size(100000);
-	m_sampler.set_network(m_network);
-	m_sampler.set_bounding_box(m_aabb);
-	m_sampler.initialize();
+	if (m_sdf.edit_mode) {
+		std::shared_ptr<SDFSampler> sampler = std::make_shared<SDFSampler>();
+		m_brush.initialize();
+		m_brush.set_size(1 << 14);
+		m_brush.set_bounding_box(m_aabb);
+		m_brush.set_network(m_network);
+		m_brush.initialize_sampler(sampler, m_training_stream);
+		CUDA_CHECK_THROW(cudaStreamSynchronize(m_training_stream));
+	}
 #endif
 }
 
@@ -1876,7 +1888,10 @@ void Testbed::train(uint32_t n_training_steps, uint32_t batch_size) {
 
 		switch (m_testbed_mode) {
 			case ETestbedMode::Nerf:  training_prep_nerf(batch_size, n_training_steps, m_training_stream);  break;
-			case ETestbedMode::Sdf:   training_prep_sdf(batch_size, n_training_steps, m_training_stream);   break;
+			case ETestbedMode::Sdf: {
+				if (!m_sdf.edit_mode) training_prep_sdf(batch_size, n_training_steps, m_training_stream);
+				break;
+			}
 			case ETestbedMode::Image: training_prep_image(batch_size, n_training_steps, m_training_stream); break;
 			case ETestbedMode::Volume:training_prep_volume(batch_size, n_training_steps, m_training_stream); break;
 			default: throw std::runtime_error{"Invalid training mode."};
@@ -1902,7 +1917,12 @@ void Testbed::train(uint32_t n_training_steps, uint32_t batch_size) {
 
 		switch (m_testbed_mode) {
 			case ETestbedMode::Nerf:   train_nerf(batch_size, n_training_steps, m_training_stream);   break;
-			case ETestbedMode::Sdf:    train_sdf(batch_size, n_training_steps, m_training_stream);    break;
+			case ETestbedMode::Sdf: {
+				if (m_sdf.edit_mode) {
+					if (m_sdf.edit_iteration) train_sdf_edit(4, m_training_stream);
+				} else train_sdf(batch_size, n_training_steps, m_training_stream);
+				break;
+			}
 			case ETestbedMode::Image:  train_image(batch_size, n_training_steps, m_training_stream);  break;
 			case ETestbedMode::Volume: train_volume(batch_size, n_training_steps, m_training_stream); break;
 			default: throw std::runtime_error{"Invalid training mode."};

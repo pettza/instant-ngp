@@ -103,6 +103,15 @@ int main(int argc, char** argv) {
 		{'v', "version"},
 	};
 
+#ifdef NGP_GUI
+	Flag sdf_edit_flag {
+		parser,
+		"SDF EDIT",
+		"Allows editing an SDF snapshot",
+		{'e', "edit"}
+	};
+#endif
+
 	// Parse command line arguments and react to parsing
 	// errors using exceptions.
 	try {
@@ -220,6 +229,19 @@ int main(int argc, char** argv) {
 #ifndef NGP_GUI
 		gui = false;
 #endif
+
+		if (sdf_edit_flag) {
+			if (mode != ETestbedMode::Sdf) {
+				tlog::error() << "The sdf edit flag can be used only in Sdf mode";
+				return 1;	
+			}
+			if (!snapshot_flag) {
+				tlog::error() << "The sdf edit flag can be used only with a snapshot";
+				return 1;
+			}
+			testbed.m_sdf.edit_mode = true;
+			tlog::info() << "Sdf edit mode enabled";
+		}
 
 		if (gui) {
 			testbed.init_window(width_flag ? get(width_flag) : 1920, height_flag ? get(height_flag) : 1080);

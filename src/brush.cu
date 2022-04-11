@@ -1,5 +1,7 @@
 #include <neural-graphics-primitives/brush.h>
 
+#include <neural-graphics-primitives/random_val.cuh>
+
 const char* vertexSource = R"foo(
 #version 330 core
 layout (location = 0) in vec2 pos;
@@ -108,7 +110,7 @@ void Brush::initialize() {
     glDeleteShader(fs);
 }
 
-void Brush::getInteractionPoint(
+void Brush::get_interaction_point(
     const RaysSdfSoa& rays,
     const Eigen::Vector2i& screen_res,
     const Eigen::Vector2i& buffer_res,
@@ -123,6 +125,8 @@ void Brush::getInteractionPoint(
     size_t idx = x + buffer_res.x() * y;
     CUDA_CHECK_THROW(cudaMemcpy(&m_position, rays.pos.data() + idx, sizeof(Eigen::Vector3f), cudaMemcpyDeviceToHost));
     CUDA_CHECK_THROW(cudaMemcpy(&m_normal, rays.normal.data() + idx, sizeof(Eigen::Vector3f), cudaMemcpyDeviceToHost));
+    m_normal.normalize();
+    coordinateSystem(m_normal, &m_tangent1, &m_tangent2);
 }
 
 void Brush::render(
@@ -130,23 +134,19 @@ void Brush::render(
 	const Eigen::Vector2f& focal_length,
 	const Eigen::Matrix<float, 3, 4>& camera_matrix
 ) {
-    if (m_position.isZero()) return;
+    if (!has_interaction()) return;
 
     Eigen::Matrix4f view2world = Eigen::Matrix4f::Identity();
 	view2world.block<3,4>(0,0) = camera_matrix;
 	Eigen::Matrix4f world2view = view2world.inverse();
-
-    // Tangent vectors    
-    Eigen::Vector3f t1, t2;
-    coordinateSystem(m_normal, &t1, &t2);
 
     glBindVertexArray(m_VAO);
     glUseProgram(m_prog);
 
 	glUniformMatrix4fv(glGetUniformLocation(m_prog, "view"), 1, GL_FALSE, (GLfloat*) &world2view);
     glUniform3f(glGetUniformLocation(m_prog, "inter"), m_position.x(), m_position.y(), m_position.z());
-	glUniform3f(glGetUniformLocation(m_prog, "t1"), t1.x(), t1.y(), t1.z());
-    glUniform3f(glGetUniformLocation(m_prog, "t2"), t2.x(), t2.y(), t2.z());
+	glUniform3f(glGetUniformLocation(m_prog, "t1"), m_tangent1.x(), m_tangent1.y(), m_tangent1.z());
+    glUniform3f(glGetUniformLocation(m_prog, "t2"), m_tangent2.x(), m_tangent2.y(), m_tangent2.z());
     glUniform2f(glGetUniformLocation(m_prog, "f"), focal_length.x(), focal_length.y());
 	glUniform2i(glGetUniformLocation(m_prog, "res"), resolution.x(), resolution.y());
     glUniform1f(glGetUniformLocation(m_prog, "radius"), m_radius);
@@ -155,6 +155,169 @@ void Brush::render(
 
     glUseProgram(0);
     glBindVertexArray(0);
+}
+
+const SamplesSoa& Brush::generate_training_samples(cudaStream_t stream) {
+    m_samples.enlarge(m_size);
+    m_samples_buffer.enlarge(m_size);
+
+    sample_bounding_box_uniform(stream, m_uniform_samples, m_rng, m_aabb, m_samples_buffer.points);
+    compute_distances_normals(stream, *m_network, m_samples_buffer, 0, m_uniform_samples);
+
+    const SamplesSoa& reg_samples = sample_model(stream);
+    
+    CUDA_CHECK_THROW(cudaMemcpyAsync(
+        m_samples_buffer.points.data() + m_uniform_samples,
+        reg_samples.points.data(),
+        m_model_samples * sizeof(Eigen::Vector3f),
+        cudaMemcpyDeviceToDevice,
+        stream
+    ));
+    CUDA_CHECK_THROW(cudaMemcpyAsync(
+        m_samples_buffer.distances.data() + m_uniform_samples,
+        reg_samples.distances.data(),
+        m_model_samples * sizeof(float),
+        cudaMemcpyDeviceToDevice,
+        stream
+    ));
+    
+    uint32_t n_accepted = filter_points_inside_interaction_area(
+        stream,
+        m_uniform_samples + m_model_samples,
+        m_samples_buffer,
+        m_samples
+    );
+
+    size_t n_interaction_samples = m_size - n_accepted;
+    sample_interaction(stream, n_accepted, n_interaction_samples);
+    apply_brush_to_samples(stream, n_accepted, n_interaction_samples);
+
+    return m_samples;
+}
+
+__global__ void filter_points_inside_interaction_area_kernel(
+    const size_t n_elements,
+    const Eigen::Vector3f center,
+    const float squared_radius,
+    uint32_t* counter,
+    const Eigen::Vector3f* __restrict__ in_points,
+    const float* __restrict__ in_distances,
+    Eigen::Vector3f* __restrict__ out_points,
+    float* out_distances
+) {
+    const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (i >= n_elements) return;
+
+    Eigen::Vector3f point = in_points[i];
+    if ((point - center).squaredNorm() > squared_radius) {
+        uint32_t out_idx = atomicAdd(counter, 1);
+        out_points[out_idx] = point;
+        out_distances[out_idx] = in_distances[i];
+    }
+}
+
+uint32_t Brush::filter_points_inside_interaction_area(
+    cudaStream_t stream,
+    size_t n_elements,
+    const SamplesSoa& in,
+    SamplesSoa& out
+) {
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_counter.data(), 0, sizeof(uint32_t), stream));
+    
+    tcnn::linear_kernel(filter_points_inside_interaction_area_kernel, 0, stream,
+        n_elements,
+        m_position,
+        m_radius * m_radius,
+        m_counter.data(),
+        in.points.data(),
+        in.distances.data(),
+        out.points.data(),
+        out.distances.data()
+    );
+
+    uint32_t cpu_counter;
+    CUDA_CHECK_THROW(cudaMemcpyAsync(&cpu_counter, m_counter.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+
+    return cpu_counter;
+}
+
+template<typename RNG>
+__global__ void sample_uniform_disk_kernel(
+    const size_t n_elements,
+    RNG rng,
+    const Eigen::Vector3f center,
+    const float radius,
+    const Eigen::Vector3f t1,
+    const Eigen::Vector3f t2,
+    Eigen::Vector3f* __restrict__ points,
+    float* __restrict__ radii
+) {
+    const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    if (i >= n_elements) return;
+    
+    rng.advance(i * 2);
+
+    Eigen::Vector2f uv = random_uniform_disc(rng);
+    radii[i] = uv.norm();
+    uv *= radius;
+    points[i] = center + uv[0] * t1 + uv[1] * t2;
+}
+
+void Brush::sample_interaction(cudaStream_t stream, size_t start_index, size_t n_samples) {
+    tcnn::linear_kernel(sample_uniform_disk_kernel<tcnn::default_rng_t>, 0, stream,
+        n_samples,
+        m_rng,
+        m_position,
+        m_radius,
+        m_tangent1,
+        m_tangent2,
+        m_samples.points.data() + start_index,
+        m_samples_buffer.distances.data()
+    );
+
+    m_rng.advance(n_samples * 2);
+
+    project_samples(stream, *m_network, m_samples, start_index, n_samples, 3);
+}
+
+__host__ __device__ float brush_shape(float x) {
+    x = 1 - x;
+    float x_sq = x * x;
+
+    return 3 * x_sq - 2 * x_sq * x;
+}
+
+__global__ void apply_brush_to_samples_kernel(
+    const size_t n_elements,
+    const float intensity,
+    const float radius,
+    const Eigen::Vector3f dir,
+    const float* __restrict__ x,
+    Eigen::Vector3f* __restrict__ points,
+    float* __restrict__ distances
+) {
+    const size_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    if (i >= n_elements) return;
+
+    float val = intensity * brush_shape(x[i]);
+    points[i] += val * dir;
+    distances[i] -= val;
+}
+
+void Brush::apply_brush_to_samples(cudaStream_t stream, size_t start_index, size_t n_samples) {
+    tcnn::linear_kernel(apply_brush_to_samples_kernel, 0, stream,
+        n_samples,
+        m_intensity,
+        m_radius,
+        m_normal,
+        m_samples_buffer.distances.data(),
+        m_samples.points.data() + start_index,
+        m_samples.distances.data() + start_index
+    );
 }
 
 NGP_NAMESPACE_END
